@@ -1,55 +1,52 @@
 #!/bin/bash
 
 helm_update() {
-	if [[ "${HELM}" == "helm_v3" ]]; then
-		LINE="$(${HELM} ls --all -f "^${NAME}\$" --namespace ${TARGET_NAMESPACE} --output json | jq -r "${JQ_CMD}" | tr '[:upper:]' '[:lower:]')"
-	else
-		LINE="$(${HELM} ls --all "^${NAME}\$" --output json | jq -r "${JQ_CMD}" | tr '[:upper:]' '[:lower:]')"
-	fi
-	IFS=, read -r INSTALLED_VERSION STATUS _ <<<${LINE}
-	VALUES=""
+	read -r STATUS REVISION APPLY_METHOD _ <<< "$(${HELM} status --namespace ${TARGET_NAMESPACE} ${NAME} --output json | jq -r "${JQ_RELEASE_EXPRESSION}")"
 
+	SSA_ARGS="$(get_ssa_args "${REVISION}" "${APPLY_METHOD}" "${SERVER_SIDE}" "${FORCE_CONFLICTS}")"
+
+	VALUES=""
 	for VALUES_FILE in /config/*.yaml; do
 		VALUES="${VALUES} --values ${VALUES_FILE}"
 	done
 
 	# Uninstall or delete chart if asked to delete and the chart was found; otherwise no-op
 	if [[ "$1" = "delete" ]]; then
-		if [[ -z "${INSTALLED_VERSION}" ]]; then
+		if [[ -z "${REVISION}" ]]; then
 			echo "No ${HELM} chart installed; nothing to delete" >> ${TERM_LOG}
 			exit
 		fi
-		if [[ "${HELM}" == "helm_v3" ]]; then
-			echo "Uninstalling ${HELM} chart" >> ${TERM_LOG}
-			${HELM} uninstall ${NAME} --namespace ${TARGET_NAMESPACE} || true
-		else
-			echo "Deleting and purging ${HELM} chart" >> ${TERM_LOG}
-			${HELM} delete ${NAME} || true
-			${HELM} "$@" --purge ${NAME}
-		fi
+
+		check_revision ${REVISION}
+
+		echo "Uninstalling ${HELM} chart" >> ${TERM_LOG}
+		${HELM} uninstall ${NAME} --namespace ${TARGET_NAMESPACE} --wait || true
 		exit
 	fi
 
 	# No current version and status, safe to install
-	if [[ "${INSTALLED_VERSION}" =~ ^(|null)$ ]] && [[ "${STATUS}" =~ ^(|null)$ ]]; then
+	if [[ -z "${REVISION}" ]] && [[ -z "${STATUS}" ]]; then
 		echo "Installing ${HELM} chart" >> ${TERM_LOG}
-		${HELM} "$@" ${NAME_ARG} ${NAME} "${CHART}" ${CA_FILE_ARG} ${TIMEOUT_ARG} ${VALUES}
+		${HELM} "$@" ${NAME_ARG} ${NAME} "${CHART}" ${CA_FILE_ARG} ${INSECURE_TLS_ARG} ${PLAIN_HTTP_ARG} ${TIMEOUT_ARG} ${LABELS_ARG} ${SSA_ARGS} ${VALUES}
 		exit
 	fi
 
-	# If a previous helm_v3 operation was interrupted unexpectedly, set it to failed.
-	if [[ "${STATUS}" =~ ^(pending-install|pending-upgrade|pending-rollback)$ ]] && [[ "${HELM}" == "helm_v3" ]]; then
+	check_revision ${REVISION}
+
+	# If a previous helm operation was interrupted unexpectedly or release state is corrupted, set it to failed.
+	if [[ "${STATUS}" =~ ^(pending-install|pending-upgrade|pending-rollback|superseded|uninstalling)$ ]]; then
 		echo Previous helm job was interrupted, updating status from ${STATUS} to failed
 		echo "Resetting ${HELM} release status from '${STATUS}' to 'failed'" >> ${TERM_LOG}
-		${HELM} set-status ${NAME} failed --namespace ${TARGET_NAMESPACE}
+		${HELM} set-status --namespace ${TARGET_NAMESPACE} ${NAME} failed
 
 		# Upgrades can be retried; install and rollback will be handled as failure below.
+		# If release state is superseded, chart deployment might be correct, try an upgrade first.
 		# If this upgrade also fails, retries of the job will handle that as failure due to the release state change.
-		if [[ "${STATUS}" == "pending-upgrade" ]]; then
+		if [[ "${STATUS}" =~ ^(pending-upgrade|superseded)$ ]]; then
 			echo "Retrying upgrade of ${HELM} chart" >> ${TERM_LOG}
 			echo "Retrying upgrade of ${NAME}"
 			shift 1
-			${HELM} upgrade "$@" ${NAME} "${CHART}" ${CA_FILE_ARG} ${TIMEOUT_ARG} ${VALUES}
+			${HELM} upgrade "$@" ${NAME} "${CHART}" ${CA_FILE_ARG} ${INSECURE_TLS_ARG} ${PLAIN_HTTP_ARG} ${TIMEOUT_ARG} ${LABELS_ARG} ${SSA_ARGS} ${VALUES}
 			exit
 		else
 			STATUS=failed
@@ -57,46 +54,53 @@ helm_update() {
 	fi
 
 	# Upgrade only if the chart is already deployed
-	if [[ "${STATUS}" == "deployed" ]]; then
+	if [[ "${STATUS}" =~ ^deployed$ ]]; then
 		echo "Already installed ${NAME}"
-		if [[ "${HELM}" == "helm_v3" ]]; then
-			${HELM} mapkubeapis ${NAME} --namespace ${TARGET_NAMESPACE}
-		else
-			${HELM} mapkubeapis ${NAME} --v2
-		fi
+		${HELM} mapkubeapis ${NAME} --namespace ${TARGET_NAMESPACE}
 
 		echo "Upgrading ${HELM} chart" >> ${TERM_LOG}
 		echo "Upgrading ${NAME}"
 		shift 1
-		${HELM} upgrade "$@" ${NAME} "${CHART}" ${CA_FILE_ARG} ${TIMEOUT_ARG} ${VALUES}
+		${HELM} upgrade "$@" ${NAME} "${CHART}" ${CA_FILE_ARG} ${INSECURE_TLS_ARG} ${PLAIN_HTTP_ARG} ${TIMEOUT_ARG} ${LABELS_ARG} ${SSA_ARGS} ${VALUES}
 		exit
 	fi
 
-	# The chart is in a bad state; try uninstalling it first
 	if [[ "${STATUS}" =~ ^(deleted|failed|null|unknown)$ ]]; then
-		if [[ "${FAILURE_POLICY:-reinstall}" == "reinstall" ]]; then
-			if [[ "${HELM}" == "helm_v3" ]]; then
-				echo "Uninstalling ${STATUS} ${HELM} chart" >> ${TERM_LOG}
-				${HELM} uninstall ${NAME} --namespace ${TARGET_NAMESPACE}
-			else
-				echo "Purging ${STATUS} ${HELM} chart" >> ${TERM_LOG}
-				${HELM} "$@" --purge ${NAME}
-			fi
+		case "${FAILURE_POLICY:-reinstall}" in
+		"abort")
+			# The chart is in a bad state; try uninstalling it first
+			echo "Release status is '${STATUS}' and failure policy is '${FAILURE_POLICY}'; waiting for operator intervention" >> ${TERM_LOG}
+			echo "Release status is '${STATUS}' and failure policy is '${FAILURE_POLICY}'; waiting for operator intervention"
+			exit 1
+			;;
+		"reinstall")
+			echo "Uninstalling ${STATUS} ${HELM} chart" >> ${TERM_LOG}
+			${HELM} uninstall ${NAME} --namespace ${TARGET_NAMESPACE} --wait
 			echo Deleted
 			# Try installing now that we've uninstalled
+			SSA_ARGS="$(get_ssa_args "" "" "${SERVER_SIDE}" "${FORCE_CONFLICTS}")"
 			echo "Installing ${HELM} chart" >> ${TERM_LOG}
-			${HELM} "$@" ${NAME_ARG} ${NAME} ${CHART} ${CA_FILE_ARG} ${TIMEOUT_ARG} ${VALUES}
+			${HELM} "$@" ${NAME_ARG} ${NAME} "${CHART}" ${CA_FILE_ARG} ${INSECURE_TLS_ARG} ${PLAIN_HTTP_ARG} ${TIMEOUT_ARG} ${LABELS_ARG} ${SSA_ARGS} ${VALUES}
 			exit
-		else
-			echo "Release status is '${STATUS}' and failure policy is '${FAILURE_POLICY}', not 'reinstall'; waiting for operator intervention" >> ${TERM_LOG}
-			echo "Release status is '${STATUS}' and failure policy is '${FAILURE_POLICY}', not 'reinstall'; waiting for operator intervention"
+			;;
+		"retry")
+			# Try upgrading again, in hope that the failure has been resolved
+			echo "Upgrading ${NAME} from failed state" >> ${TERM_LOG}
+			shift 1
+			${HELM} upgrade "$@" ${NAME} "${CHART}" ${CA_FILE_ARG} ${INSECURE_TLS_ARG} ${PLAIN_HTTP_ARG} ${TIMEOUT_ARG} ${LABELS_ARG} ${SSA_ARGS} ${VALUES}
+			exit 0
+			;;
+		*)
+			echo "Unknown failure policy '${FAILURE_POLICY}'" >> ${TERM_LOG}
+			echo "Unknown failure policy '${FAILURE_POLICY}'"
 			exit 1
-		fi
+			;;
+		esac
 	fi
 
 	# No special status handling necessary, do whatever we were asked to do
 	echo "Installing ${HELM} chart" >> ${TERM_LOG}
-	${HELM} "$@" ${NAME_ARG} ${NAME} "${CHART}" ${CA_FILE_ARG} ${TIMEOUT_ARG} ${VALUES}
+	${HELM} "$@" ${NAME_ARG} ${NAME} "${CHART}" ${CA_FILE_ARG} ${INSECURE_TLS_ARG} ${PLAIN_HTTP_ARG} ${TIMEOUT_ARG} ${LABELS_ARG} ${SSA_ARGS} ${VALUES}
 }
 
 helm_repo_init() {
@@ -107,17 +111,25 @@ helm_repo_init() {
 		return
 	fi
 
-	if [[ "${HELM}" == "helm_v3" ]]; then
-		if [[ ${CHART} == stable/* ]]; then
-			${HELM} repo add ${CA_FILE_ARG} stable ${STABLE_REPO_URL}
-			${HELM} repo update
-		fi
-	else
-		${HELM} repo update --strict || ${HELM} repo remove stable
+	if [[ ${CHART} == stable/* ]]; then
+		${HELM} repo add ${CA_FILE_ARG} ${INSECURE_TLS_ARG} stable ${STABLE_REPO_URL}
+		${HELM} repo update
 	fi
 
 	if [[ -n "${REPO}" ]]; then
-		${HELM} repo add ${CA_FILE_ARG} ${NAME%%/*} ${REPO}
+		if [[ -f "${AUTH_DIR}/username" ]] && [[ -f "${AUTH_DIR}/password" ]]; then
+			if [[ "${AUTH_PASS_CREDENTIALS}" == "true" ]]; then
+				PASS_CREDENTIALS_ARG="--pass-credentials"
+			fi
+			cat ${AUTH_DIR}/password | ${HELM} repo add ${CA_FILE_ARG} ${INSECURE_TLS_ARG} ${PASS_CREDENTIALS_ARG} --username "$(cat ${AUTH_DIR}/username)" --password-stdin ${NAME%%/*} ${REPO}
+		elif [[ -f "${AUTH_DIR}/tls.crt" ]] && [[ -f "${AUTH_DIR}/tls.key" ]]; then
+			if [[ "${AUTH_PASS_CREDENTIALS}" == "true" ]]; then
+				PASS_CREDENTIALS_ARG="--pass-credentials"
+			fi
+			${HELM} repo add ${CA_FILE_ARG} ${INSECURE_TLS_ARG} ${PASS_CREDENTIALS_ARG} --cert-file ${AUTH_DIR}/tls.crt --key-file ${AUTH_DIR}/tls.key ${NAME%%/*} ${REPO}
+		else
+			${HELM} repo add ${CA_FILE_ARG} ${INSECURE_TLS_ARG} ${NAME%%/*} ${REPO}
+		fi
 		${HELM} repo update
 	fi
 }
@@ -134,16 +146,69 @@ helm_content_decode() {
 	set +e
 }
 
+check_revision() {
+	set -e
+	REVISION="$1"
+	if [[ -n "${EXPECTED_RELEASE_REVISION}" ]] && [[ "${EXPECTED_RELEASE_REVISION}" != "${REVISION}" ]]; then
+		echo "Current release revision ${REVISION} does not match expected revision ${EXPECTED_RELEASE_REVISION}" >> ${TERM_LOG}
+		echo "Current release revision ${REVISION} does not match expected revision ${EXPECTED_RELEASE_REVISION}"
+		exit
+	fi
+	set +e
+}
+
+get_ssa_args() {
+	set -e
+	REVISION="$1"
+	APPLY_METHOD="$2"
+	SERVER_SIDE="$3"
+	FORCE_CONFLICTS="$4"
+
+	# --server-side only supports true/false when installing; replace auto with true
+	# if no revision is currently installed.
+	if [[ -z "${REVISION}" ]] && [[ "${SERVER_SIDE}" =~ ^auto$ ]]; then
+		SERVER_SIDE="true"
+	fi
+
+	# --force-conflicts cannot be set if --server-side is false; disable it if SSA is false,
+	# or will auto to false.
+	if [[ "${FORCE_CONFLICTS}" =~ ^true$ ]]; then
+		if [[ "${SERVER_SIDE}" == ^false$ ]] || { [[ "${SERVER_SIDE}" =~ ^auto$ ]] && [[ ! "${APPLY_METHOD}" =~ ^ssa$ ]]; }; then
+			FORCE_CONFLICTS="false"
+		fi
+	fi
+
+	if [[ -n "${SERVER_SIDE}" ]]; then
+		echo -n "--server-side=${SERVER_SIDE} "
+	fi
+	if [[ -n "${FORCE_CONFLICTS}" ]]; then
+		echo -n "--force-conflicts=${FORCE_CONFLICTS} "
+	fi
+	echo
+	set +e
+}
+
+# do not interrupt helm while it is running, or it will likely leave the release in a pending state
+trap "" SIGINT SIGTERM
+
 export CA_FILE=/config/ca-file.pem
+export CA_DIR=/ca-files
+export AUTH_DIR=/auth
 export TERM_LOG=/dev/termination-log
 export SSL_CERT_FILE=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
 export SSL_CERT_DIR=/etc/ssl/certs
 export HELM_TLS_CA_CERT=${SSL_CERT_FILE}
-HELM="helm_v3"
+HELM="helm"
 NAME_ARG=""
 CA_FILE_ARG=""
+INSECURE_TLS_ARG=""
+PLAIN_HTTP_ARG=""
 TIMEOUT_ARG=""
-JQ_CMD='"\(.[0].app_version),\(.[0].status)"'
+PASS_CREDENTIALS_ARG=""
+LABELS_ARG=""
+SSA_ARGS=""
+CONFIG_HASH_KEY="helmcharts.helm.cattle.io/configHash"
+JQ_RELEASE_EXPRESSION='[.info.status,.version,.apply_method]|@tsv'
 
 set -e -v
 if [[ ${KUBERNETES_SERVICE_HOST} =~ .*:.* ]]; then
@@ -155,38 +220,43 @@ fi
 
 set +v -x
 
-if [[ "${BOOTSTRAP}" != "true" ]]; then
-	tiller --listen=127.0.0.1:44134 --storage=secret &
-	export HELM_HOST=127.0.0.1:44134
-
-	helm_v2 init --skip-refresh --client-only --stable-repo-url ${STABLE_REPO_URL}
-	V2_CHART_EXISTS=$(timeout -s KILL 30 helm_v2 ls --all "^${NAME}\$" --output json | jq -r '.Releases | length')
-fi
-
-if [[ "${V2_CHART_EXISTS}" == "1" ]] || [[ "${HELM_VERSION}" == "v2" ]]; then
-	if [[ "${BOOTSTRAP}" == "true" ]]; then
-		echo "Can't bootstrap ${HELM} chart" >> ${TERM_LOG}
-		echo "Error: bootstrap flag can't be set with helm version 2 charts, please remove the bootstrap flag and update the chart"
-		exit 1
-	fi
-	HELM="helm_v2"
-	NAME_ARG="--name"
-	JQ_CMD='"\(.Releases[0].AppVersion),\(.Releases[0].Status)"'
-fi
-
-if [[ -f "${CA_FILE}" ]]; then
-	CA_FILE_ARG="--ca-file ${CA_FILE}"
-fi
-
-if [[ -n "${TIMEOUT}" ]]; then
-	if [[ "${HELM}" == "helm_v3" ]]; then
-		TIMEOUT_ARG="--timeout ${TIMEOUT}"
-	else
-		echo "Warning: timeout flag can't be set with version 2 charts, using default timeout"
-	fi
+if [[ "${HELM_VERSION}" == "v2" ]]; then
+	echo "Helm v2 is EOL effective 2020-11-13; upgrade your chart to helm v3" >> ${TERM_LOG}
+	echo "Helm v2 is EOL effective 2020-11-13; upgrade your chart to helm v3"
+	exit 64
 fi
 
 shopt -s nullglob
+
+if [[ -f "${CA_FILE}" ]]; then
+	echo >> /tmp/ca-file.pem
+	cat "${CA_FILE}" >> /tmp/ca-file.pem
+fi
+
+for CA_FILE in "${CA_DIR}"/*; do
+	echo >> /tmp/ca-file.pem
+	cat "${CA_FILE}" >> /tmp/ca-file.pem
+done
+
+if [[ -f "/tmp/ca-file.pem" ]]; then
+	CA_FILE_ARG="--ca-file /tmp/ca-file.pem"
+fi
+
+if [[ "${INSECURE_SKIP_TLS_VERIFY}" == "true" ]]; then
+	INSECURE_TLS_ARG="--insecure-skip-tls-verify"
+fi
+
+if [[ "${PLAIN_HTTP}" == "true" ]]; then
+	PLAIN_HTTP_ARG="--plain-http"
+fi
+
+if [[ -n "${TIMEOUT}" ]]; then
+	TIMEOUT_ARG="--timeout ${TIMEOUT}"
+fi
+
+if [[ -n "${CONFIG_HASH}" ]]; then
+	LABELS_ARG="--labels ${CONFIG_HASH_KEY}=${CONFIG_HASH}"
+fi
 
 helm_content_decode
 if [[ "$1" != "delete" ]]; then
